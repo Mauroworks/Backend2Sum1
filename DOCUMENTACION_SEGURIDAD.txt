@@ -1,0 +1,233 @@
+# Documentación de Seguridad - Minimarket API
+
+---
+
+## 1. Análisis del Caso: Amenazas Identificadas y Estrategia Seleccionada
+
+### Amenazas Identificadas
+
+| Amenaza | Descripci�n | Impacto |
+|---------|-------------|---------|
+| **Acceso no autorizado a endpoints** | Usuarios sin autenticaci�n acceden a recursos protegidos | Alto |
+| **Escalaci�n de privilegios** | Usuario con rol limitado accede a funciones administrativas | Alto |
+| **Intercepci�n de credenciales** | Contrase�as enviadas en texto plano | Alto |
+| **Robo de sesi�n** | Secuestro de sesi�n mediante cookies o tokens robados | Medio |
+| **Ataques CSRF** | Solicitudes cruzadas maliciosas aprovechando sesiones activas | Medio |
+| **Inyecci�n de tokens falsos** | Tokens JWT fraudulentos generados sin la clave secreta | Alto |
+| **Fuga de informaci�n** | Exposici�n de datos sensibles como passwords o roles | Medio |
+
+### Estrategia Seleccionada: JWT + BCrypt + Autorizaci�n por Roles
+
+Se opt� por un esquema de **autenticaci�n stateless basado en JWT** por las siguientes razones:
+
+1. **Escalabilidad:** Al ser stateless, no requiere almacenamiento en servidor, facilitando horizontal scaling.
+2. **Seguridad de credenciales:** BCrypt con factor de trabajo asegura que las contrase�as almacenadas son resistentes a ataques de fuerza bruta.
+3. **Control de acceso granular:** Los roles (CLIENTE, EMPLEADO, ADMINISTRADOR) permiten aplicar el principio de m�nimo privilegio mediante `@PreAuthorize`.
+4. **Estandarizaci�n:** JWT es un est�ndar abierto (RFC 7519) con amplio soporte en la industria.
+
+---
+
+## 2. Gu�a de Configuraci�n
+
+### 2.1 Dependencias (pom.xml)
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-security</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-api</artifactId>
+    <version>0.12.6</version>
+</dependency>
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-impl</artifactId>
+    <version>0.12.6</version>
+    <scope>runtime</scope>
+</dependency>
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-jackson</artifactId>
+    <version>0.12.6</version>
+    <scope>runtime</scope>
+</dependency>
+```
+
+### 2.2 Propiedades (application.properties)
+
+```properties
+jwt.secret=MiClaveSecretaSuperSeguraParaMinimarket2024TokenJWT
+jwt.expiration=86400000
+```
+
+- `jwt.secret`: Clave secreta HMAC-SHA para firmar/verificar tokens.
+- `jwt.expiration`: Tiempo de vida del token en milisegundos (24 horas).
+
+### 2.3 Configuraci�n de Seguridad (SecurityConfig.java)
+
+```java
+@Configuration
+@EnableMethodSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(csrf -> csrf.disable())
+            .sessionManagement(session ->
+                session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/public/**").permitAll()
+                .requestMatchers("/api/auth/**").permitAll()
+                .requestMatchers("/h2-console/**").permitAll()
+                .anyRequest().authenticated()
+            )
+            .addFilterBefore(jwtAuthenticationFilter,
+                UsernamePasswordAuthenticationFilter.class);
+        return http.build();
+    }
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+}
+```
+
+### 2.4 JwtUtil - Generaci�n y Validaci�n de Tokens
+
+- `generateToken(username, roles)`: Crea un token JWT con subject (username) y claims (roles).
+- `extractUsername(token)`: Extrae el username del token.
+- `extractRoles(token)`: Extrae los roles del token.
+- `isTokenValid(token)`: Verifica que el token tenga firma v�lida y no est� expirado.
+
+### 2.5 JwtAuthenticationFilter
+
+Filtro que intercepta cada solicitud HTTP:
+1. Extrae el token del header `Authorization: Bearer <token>`.
+2. Valida el token usando `JwtUtil`.
+3. Si es v�lido, carga el `UserDetails` y lo establece en el `SecurityContext`.
+4. Si no hay token o es inv�lido, la solicitud contin�a (ser� rechazada por el endpoint si requiere autenticaci�n).
+
+### 2.6 Autenticaci�n (AuthController)
+
+- **POST /api/auth/login**: Recibe `{ "username": "...", "password": "..." }`, autentica contra la base de datos y retorna un JWT.
+- **POST /api/auth/register**: Registra un nuevo usuario con rol CLIENTE por defecto.
+
+### 2.7 Roles y Acceso
+
+| Rol | Endpoints Permitidos |
+|-----|---------------------|
+| **CLIENTE** | Productos (GET), Carrito (CRUD), Ventas (POST) |
+| **EMPLEADO** | Todo lo de CLIENTE + Categor�as, Inventario, DetalleVentas, Ventas (GET) |
+| **ADMINISTRADOR** | Todo lo anterior + Usuarios (CRUD completo) |
+
+### 2.8 Usuarios por Defecto (DataInitializer)
+
+| Usuario | Contrase�a | Rol |
+|---------|-----------|-----|
+| `admin` | `admin123` | ADMINISTRADOR |
+| `empleado` | `empleado123` | EMPLEADO |
+| `cliente` | `cliente123` | CLIENTE |
+
+---
+
+## 3. Explicaci�n T�cnica
+
+### 3.1 Protecci�n contra Acceso No Autorizado
+
+**Mecanismo:** El `JwtAuthenticationFilter` se ejecuta antes de que cualquier solicitud llegue a los controladores. Verifica la presencia y validez del token JWT en el header `Authorization`. Sin un token v�lido, el `SecurityContext` queda vac�o y Spring Security rechaza la solicitud con HTTP 401.
+
+**Flujo:**
+```
+Cliente -> Header: Bearer <token> -> JwtAuthenticationFilter -> SecurityContext -> Controller
+```
+
+### 3.2 Protecci�n contra Escalaci�n de Privilegios
+
+**Mecanismo:** Se utiliza `@PreAuthorize` con expresiones como `hasRole('ADMINISTRADOR')` y `hasAnyRole('EMPLEADO', 'ADMINISTRADOR')`. Spring Security eval�a estos guards antes de ejecutar el m�todo del controlador. Si el usuario autenticado no tiene el rol requerido, recibe HTTP 403 Forbidden.
+
+**Ejemplos:**
+```java
+@PreAuthorize("hasRole('ADMINISTRADOR')")    // Solo administradores
+@PreAuthorize("hasAnyRole('EMPLEADO', 'ADMINISTRADOR')")  // Empleados y admins
+@PreAuthorize("hasAnyRole('CLIENTE', 'EMPLEADO', 'ADMINISTRADOR')")  // Todos autenticados
+```
+
+### 3.3 Protecci�n de Contrase�as (BCrypt)
+
+**Mecanismo:** BCryptPasswordEncoder implementa el algoritmo bcrypt con salt incorporado. Cada contrase�a se almacena como un hash del formato `$2a$10$...` donde `10` es el factor de trabajo. Esto hace que:
+- Dos usuarios con la misma contrase�a tengan hashes diferentes (por el salt).
+- Ataques de rainbow table sean inviables.
+- Ataques de fuerza bruta sean lentos (el factor de trabajo incrementa el tiempo de c�mputo).
+
+### 3.4 Protecci�n contra Tokens Falsificados (JWT)
+
+**Mecanismo:** Los tokens JWT est�n firmados con HMAC-SHA256 usando una clave secreta (`jwt.secret`). Sin conocer esta clave, un atacante no puede generar tokens v�lidos. `JwtUtil.parser().verifyWith(secretKey)` verifica la firma en cada solicitud.
+
+### 3.5 Protecci�n contra CSRF
+
+**Mecanismo:** Al usar `SessionCreationPolicy.STATELESS`, la aplicaci�n no crea sesiones en el servidor. Sin sesiones, los ataques CSRF (que dependen de cookies de sesi�n) no son aplicables. Por eso se deshabilita CSRF (`csrf.disable()`).
+
+### 3.6 Protecci�n contra Intercepci�n
+
+**Recomendaci�n:** En producci�n, toda la comunicaci�n debe hacerse exclusivamente por HTTPS para evitar que tokens y credenciales sean interceptados en tr�nsito (ataques Man-in-the-Middle).
+
+---
+
+## 4. Pruebas Funcionales
+
+### 4.1 Obtener Token (Login)
+
+```bash
+curl -X POST http://localhost:8080/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}'
+```
+
+Respuesta:
+```json
+{
+  "token": "eyJhbGciOiJIUzI1NiJ9...",
+  "username": "admin",
+  "roles": ["ROLE_ADMINISTRADOR"]
+}
+```
+
+### 4.2 Acceder a Endpoint Protegido
+
+```bash
+curl -X GET http://localhost:8080/api/usuarios \
+  -H "Authorization: Bearer <token>"
+```
+
+### 4.3 Verificaci�n de Roles
+
+**Cliente intentando acceder a usuarios (debe fallar con 403):**
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"cliente","password":"cliente123"}' | jq -r '.token')
+curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/usuarios \
+  -H "Authorization: Bearer $TOKEN"
+# Respuesta: 403
+```
+
+**Admin accediendo a usuarios (debe funcionar):**
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}' | jq -r '.token')
+curl http://localhost:8080/api/usuarios \
+  -H "Authorization: Bearer $TOKEN"
+# Respuesta: 200 OK con lista de usuarios
+```
+
+### 4.4 Sin Token (debe fallar con 401)
+
+```bash
+curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/productos
+# Respuesta: 401
+```
